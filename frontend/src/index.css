@@ -1,8 +1,41 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-body {
-    background-color: #020617;
-    color: white;
+@layer base {
+  /* Set the default sans-serif font to Inter */
+  html {
+    font-family: 'Inter', sans-serif;
+  }
+
+  /* Ensure the body defaults to pure black to prevent any white flashing on page reload */
+  body {
+    @apply bg-black text-slate-300 antialiased;
+  }
+}
+
+@layer utilities {
+  /* Force the mono class to use our premium JetBrains Mono font */
+  .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  /* Ultra-thin, dark custom scrollbar for the Execution Tape */
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 4px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    @apply bg-slate-800 rounded-full;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    @apply bg-slate-700;
+  }
 }

@@ -82,4 +82,9 @@ public class BinanceStreamService {
             System.out.println("Flushed " + processedCount + " trades to persistence SQL Database");
         }
     }
+
+    //Get queue size for frontend
+    public int getQueueSize() {
+        return memoryBuffer.getSize();
+    }
 }
