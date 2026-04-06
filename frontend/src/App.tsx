@@ -13,8 +13,11 @@ export default function App() {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartInstanceRef = useRef<any>(null);
   const seriesRef = useRef<any>(null);
-  const rawTradesMemoryRef = useRef<any[]>([]);
 
+  const prevTimeframeRef = useRef<number>(timeframe);
+  const baseCandlesRef = useRef<Map<number, any>>(new Map());
+
+  // --- 1. DATA FETCHING ---
   const fetchData = async () => {
     try {
       const [tradeRes, healthRes] = await Promise.all([
@@ -35,7 +38,7 @@ export default function App() {
     return () => { clearInterval(dataInterval); clearInterval(clockInterval); };
   }, []);
 
-  // THE FIX: Parses Java dates explicitly as UTC to prevent browser offset glitches
+  // --- 2. ENGINE LOGIC ---
   const parseJavaDate = (timestamp: any) => {
     if (Array.isArray(timestamp)) {
       const ms = timestamp[6] ? Math.floor(timestamp[6] / 1000000) : 0;
@@ -44,34 +47,56 @@ export default function App() {
     return timestamp ? new Date(timestamp) : new Date();
   };
 
-  const aggregateToOHLC = (rawTrades: any[], intervalSeconds: number) => {
-    if (rawTrades.length === 0) return [];
-    const candles = new Map();
+  const ingestTrades = (rawTrades: any[]) => {
     rawTrades.forEach(trade => {
       const date = parseJavaDate(trade.timestamp);
-      const bucketTime = Math.floor(date.getTime() / (intervalSeconds * 1000)) * (intervalSeconds * 1000);
-
-      // THE FIX: Strict number coercion to prevent canvas rendering errors
+      const secTime = Math.floor(date.getTime() / 1000);
       const price = Number(trade.price);
+
       if (isNaN(price)) return;
 
-      if (!candles.has(bucketTime)) candles.set(bucketTime, { time: bucketTime / 1000, open: price, high: price, low: price, close: price });
-      else {
-        const c = candles.get(bucketTime);
+      if (!baseCandlesRef.current.has(secTime)) {
+        baseCandlesRef.current.set(secTime, { time: secTime, open: price, high: price, low: price, close: price });
+      } else {
+        const c = baseCandlesRef.current.get(secTime);
         c.high = Math.max(c.high, price);
         c.low = Math.min(c.low, price);
         c.close = price;
       }
     });
-    return Array.from(candles.values()).sort((a, b) => a.time - b.time);
+
+    const ONE_DAY_SECONDS = 24 * 60 * 60;
+    const cutoffTime = Math.floor(Date.now() / 1000) - ONE_DAY_SECONDS;
+    for (const [time] of baseCandlesRef.current) {
+      if (time < cutoffTime) baseCandlesRef.current.delete(time);
+    }
   };
 
-  // Safe wipe on timeframe change
+  const getRolledUpCandles = (intervalSeconds: number) => {
+    const rolledMap = new Map();
+    const baseCandles = Array.from(baseCandlesRef.current.values()).sort((a, b) => a.time - b.time);
+
+    baseCandles.forEach(bc => {
+      const bucketTime = Math.floor(bc.time / intervalSeconds) * intervalSeconds;
+
+      if (!rolledMap.has(bucketTime)) {
+        rolledMap.set(bucketTime, { time: bucketTime, open: bc.open, high: bc.high, low: bc.low, close: bc.close });
+      } else {
+        const rc = rolledMap.get(bucketTime);
+        rc.high = Math.max(rc.high, bc.high);
+        rc.low = Math.min(rc.low, bc.low);
+        rc.close = bc.close;
+      }
+    });
+
+    return Array.from(rolledMap.values()).sort((a, b) => a.time - b.time);
+  };
+
   const changeTimeframe = (seconds: number) => {
     setTimeframe(seconds);
-    if (seriesRef.current) seriesRef.current.setData([]);
   };
 
+  // --- 3. CHART RENDERING ---
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
@@ -79,12 +104,34 @@ export default function App() {
       const chart = createChart(chartContainerRef.current, {
         layout: { background: { type: ColorType.Solid, color: '#09090b' }, textColor: '#52525b', fontFamily: "'JetBrains Mono', monospace" },
         grid: { vertLines: { color: '#ffffff08' }, horzLines: { color: '#ffffff08' } },
-        timeScale: { timeVisible: true, secondsVisible: true, borderColor: '#ffffff15' },
-        rightPriceScale: { borderColor: '#ffffff15', autoScale: true } // AutoScale ensures price axis recovers
+        timeScale: {
+          timeVisible: true,
+          secondsVisible: true,
+          borderColor: '#ffffff15',
+          barSpacing: 14, // Keep spacing so sparse data doesn't look too thin
+          rightOffset: 8,
+          minBarSpacing: 5,
+        },
+        rightPriceScale: { borderColor: '#ffffff15', autoScale: true },
+        crosshair: {
+          mode: 1,
+          vertLine: { width: 1, color: '#ffffff20', style: 3 },
+          horzLine: { width: 1, color: '#ffffff20', style: 3 },
+        }
       });
 
       const candlestickSeries = chart.addSeries(CandlestickSeries, {
-        upColor: '#10b981', downColor: '#ef4444', borderVisible: false, wickUpColor: '#10b981', wickDownColor: '#ef4444',
+        // REVERTED: Back to the sleek, borderless neon aesthetic
+        upColor: '#10b981',
+        downColor: '#ef4444',
+        borderVisible: false,
+        wickUpColor: '#10b981',
+        wickDownColor: '#ef4444',
+        priceFormat: {
+                    type: 'price',
+                    precision: 2,
+                    minMove: 0.01,
+                },
       });
 
       chartInstanceRef.current = chart;
@@ -93,36 +140,27 @@ export default function App() {
 
     if (trades.length > 0 && seriesRef.current) {
       try {
-        // 1. THE FIX: Cryptographic Trade Deduplication (Guarantees zero dropped or duplicated trades)
-        const getTradeKey = (t: any) => `${Array.isArray(t.timestamp) ? t.timestamp.join('-') : t.timestamp}-${t.price}-${t.quantity}`;
-        const existingKeys = new Set(rawTradesMemoryRef.current.map(getTradeKey));
-        const trulyNewTrades = trades.filter(t => !existingKeys.has(getTradeKey(t)));
+        ingestTrades(trades);
+        const fullCandles = getRolledUpCandles(timeframe);
 
-        let buffer = [...rawTradesMemoryRef.current, ...trulyNewTrades];
-
-        // 2. THE FIX: Relative Time Buffer (100% immune to browser/server timezone mismatches)
-        if (buffer.length > 0) {
-          const newestTime = parseJavaDate(buffer[buffer.length - 1].timestamp).getTime();
-          const oneHourAgo = newestTime - (60 * 60 * 1000);
-          buffer = buffer.filter(t => parseJavaDate(t.timestamp).getTime() > oneHourAgo);
+        let isTimeframeSwap = false;
+        if (prevTimeframeRef.current !== timeframe) {
+          isTimeframeSwap = true;
+          prevTimeframeRef.current = timeframe;
         }
 
-        rawTradesMemoryRef.current = buffer;
-
-        // 3. Rebuild and Stream
-        const fullCandles = aggregateToOHLC(buffer, timeframe);
         const currentData = seriesRef.current.data();
-
-        if (currentData.length === 0) {
+        if (isTimeframeSwap || currentData.length === 0) {
           seriesRef.current.setData(fullCandles);
         } else {
           const lastCandle = fullCandles[fullCandles.length - 1];
           if (lastCandle) seriesRef.current.update(lastCandle);
         }
-      } catch (e) { console.error(e); }
+      } catch (e) { console.error("Engine Repaint Error:", e); }
     }
   }, [trades, timeframe]);
 
+  // --- 4. UI MATH ---
   const currentPrice = trades.length > 0 ? trades[trades.length - 1].price : 0;
   const formattedUTC = currentTime.toISOString().substr(11, 8) + ' UTC';
   const totalSeconds = Math.floor(currentTime.getTime() / 1000);
@@ -134,6 +172,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-black text-zinc-300 py-6 px-4 sm:py-12 sm:px-8 font-sans selection:bg-blue-500/30 relative flex flex-col items-center">
 
+      {/* ARCHITECTURE MODAL */}
       {isInfoOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4 transition-all">
           <div className="bg-[#09090b] border border-white/10 w-full max-w-2xl rounded-2xl shadow-2xl flex flex-col overflow-hidden">
@@ -170,6 +209,7 @@ export default function App() {
 
       <div className="w-full max-w-[1400px] flex flex-col gap-6">
 
+        {/* HEADER BAR */}
         <header className="flex flex-col md:flex-row justify-between items-start md:items-center gap-6 bg-[#09090b] border border-white/10 p-5 rounded-2xl shadow-xl">
           <div className="flex items-center gap-3">
             <div className="p-2 bg-emerald-500/10 rounded-lg"><Terminal className="text-emerald-500" size={20} /></div>
@@ -214,6 +254,7 @@ export default function App() {
           </div>
         </header>
 
+        {/* WORKSPACE */}
         <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
           <div className="lg:col-span-3 bg-[#09090b] border border-white/10 rounded-2xl overflow-hidden flex flex-col h-[650px] shadow-xl">
             <div className="flex justify-between items-center px-6 py-4 border-b border-white/5 bg-white/[0.01]">
@@ -251,6 +292,7 @@ export default function App() {
                 <tbody>
                   {[...trades].reverse().map((trade, i) => (
                     <tr key={i} className="group hover:bg-white/[0.04] transition-colors rounded-lg">
+                      {/* REVERTED: Back to Tailwind colors */}
                       <td className={`py-1.5 px-2 text-left rounded-l-md ${trade.type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}`}>
                         {trade.price.toFixed(2)}
                       </td>
